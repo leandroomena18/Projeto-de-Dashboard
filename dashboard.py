@@ -22,8 +22,8 @@ st.title("Dashboard dos Projetos de Lei da Câmara dos Deputados - OASIS")
 def load_data(query):
     conn = mysql.connector.connect(
         host="localhost",
-        user="fabiocs",
-        password="Fcs@26734103",
+        user="root",
+        password="91574602",
         database="Oasis"
     )
     return pd.read_sql(query, conn)

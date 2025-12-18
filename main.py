@@ -10,7 +10,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # --- CONFIGURAÇÃO DO BANCO DE DADOS ---
 DB_HOST = "localhost"
 DB_USER = "root"
-DB_PASSWORD = "dudu2004"
+DB_PASSWORD = "91574602"
 
 def obter_caminho(nome_arquivo):
     """Retorna o caminho completo compatível com o sistema operacional"""
