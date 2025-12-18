@@ -1,453 +1,436 @@
-
-#sem limite de proposições para a tabela e pontuação acima de 0.5
-
 import requests
 import json
 import os
 import time
 import re
 import csv
-from datetime import datetime, timedelta
-
-# --- Novas importações necessárias para a busca semântica ---
+import sys
+import pickle
 import numpy as np
-import pandas as pd
+import torch
+import unicodedata
+from datetime import datetime, timedelta
 from sentence_transformers import SentenceTransformer, util
-# -----------------------------------------------------------
 
-# --- Funções de Utilidade Compartilhadas ---
-def salvar_para_json(dados, nome_arquivo):
+# =============================================================================
+# 1. CONFIGURAÇÕES GERAIS
+# =============================================================================
+CAMARA_BASE_URL = "https://dadosabertos.camara.leg.br/api/v2"
+
+# Configuração de Datas para Coleta
+# Ajuste DATA_INICIO_COLETA conforme necessário para o histórico desejado
+DATA_INICIO_COLETA = datetime(2023, 1, 1) 
+DATA_FIM_COLETA = datetime.now()
+TIPOS_DOCUMENTO = ["PL", "PLP", "PEC"]
+
+# Configuração de Busca e Filtro
+CONSULTA_USUARIO = "Regulamentação inteligência artificial e algoritmos"
+MODELO_NOME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+PESO_SEMANTICO = 0.5
+PESO_KEYWORD = 0.5    
+FILTRO_THRESHOLD = 0.45
+
+# Nomes de Arquivos (Internos e de Saída)
+NOME_ARQUIVO_BANCO_DADOS = "camara_db_completo_cache.json"
+NOME_ARQUIVO_CACHE_IDS = "temp_lista_ids.json"
+NOME_ARQUIVO_PKL = "keywords_embeddings.pkl"
+ARQUIVO_CACHE_EMB = "cache_ementas_paraphrase.npy"
+
+# IMPORTANTE: Este nome deve ser o mesmo que o main.py espera mover
+NOME_ARQUIVO_SAIDA_FINAL_CSV = "proposicoes_camara_resumo.csv"
+
+# =============================================================================
+# 2. UTILITÁRIOS LEGISLATIVOS (Integrado do utils_legislativo.py)
+# =============================================================================
+
+# Lista Expandida de Stopwords Legislativas
+STOPWORDS_LEGISLATIVAS = [
+    # Ações Burocráticas
+    "dispõe sobre", "dispoe sobre", "trata de", "institui o", "institui a",
+    "cria o", "cria a", "estabelece", "normas gerais", "providências",
+    "dá outras providências", "da outras providencias", "para os fins",
+    "nos termos", "com a finalidade de", "visando a", "a fim de",
+    "para dispor sobre", "para prever", "para estender", "para aperfeiçoar",
+    
+    # Estruturas de Alteração
+    "altera a lei", "altera o decreto", "altera os", "altera as",
+    "acrescenta", "insere", "modifica", "revoga", "redação dada",
+    "redacao dada", "nova redação", "suprime", "veda a", "veda o",
+    
+    # Referências a Textos Legais (Stopwords Simples)
+    "projeto de lei", "pl", "medida provisória", "mpv", "pec",
+    "código penal", "código civil", "estatuto", "constituição federal",
+    "decreto-lei", "decreto lei", "lei brasileira", "lei de",
+    
+    # Partes da Lei (Stopwords Simples)
+    "caput", "parágrafo único", "paragrafo unico", "inciso", "alínea", 
+    "alinea", "item", "dispositivo", "anexo"
+]
+
+def limpar_padroes_regex(texto):
     """
-    Salva um dicionário/lista Python em um arquivo JSON.
+    Remove padrões complexos como datas e números de leis usando Regex.
     """
+    # 1. Remove referências a leis com números (ex: "Lei nº 12.345", "Lei 12.345")
+    texto = re.sub(r'(lei|decreto|medida provisória|resolução|portaria)\s+(n[ºo°]\s*)?[\d\.]+', ' ', texto, flags=re.IGNORECASE)
+    
+    # 2. Remove datas completas (ex: "de 23 de abril de 2014", "de 7 de dezembro")
+    texto = re.sub(r'\bde\s+\d{1,2}\s+de\s+[a-zç]+\s+de\s+\d{4}\b', ' ', texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\bde\s+\d{1,2}\s+de\s+[a-zç]+\b', ' ', texto, flags=re.IGNORECASE)
+    
+    # 3. Remove referências a Artigos e Parágrafos (ex: "art. 5º", "§ 2º", "art 10")
+    texto = re.sub(r'\bart[\.\s]\s*\d+[ºo°]?', ' ', texto, flags=re.IGNORECASE) # Artigos
+    texto = re.sub(r'§\s*\d+[ºo°]?', ' ', texto) # Símbolo de parágrafo
+    
+    # 4. Remove numeração romana de Incisos (ex: "inciso IV", "inciso X")
+    texto = re.sub(r'\binciso\s+[ivxlcdm]+\b', ' ', texto, flags=re.IGNORECASE)
+    
+    return texto
+
+def limpar_ementa_para_vetorizacao(texto):
+    if not texto: return ""
+    
+    # 1. Normalização Básica (Caixa baixa e acentos)
+    texto = texto.lower()
+    texto = ''.join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
+    
+    # 2. Limpeza de Padrões (Datas e Números)
+    texto = limpar_padroes_regex(texto)
+    
+    # 3. Limpeza de Stopwords (Lista Fixa)
+    for termo in STOPWORDS_LEGISLATIVAS:
+        # Remove o termo se ele estiver no texto
+        texto = texto.replace(termo, " ")
+        
+    # 4. Limpeza final de pontuação e espaços extras
+    texto = re.sub(r'[^\w\s]', ' ', texto) # Remove pontuação restante
+    texto = re.sub(r'\s+', ' ', texto).strip() # Remove espaços duplos
+    
+    return texto
+
+def limpar_texto_basico(texto):
+    """Função leve usada apenas para limpeza simples (busca BM25/Keywords)."""
+    if not texto: return ""
+    texto = texto.lower()
+    texto = ''.join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
+    return texto
+
+# =============================================================================
+# 3. MÓDULO DE COLETA (Lógica do coletor_camara.py)
+# =============================================================================
+def salvar_json(dados, nome_arquivo):
     try:
         with open(nome_arquivo, 'w', encoding='utf-8') as f:
             json.dump(dados, f, indent=4, ensure_ascii=False)
-        print(f"\nDados salvos com sucesso em '{nome_arquivo}'")
-        print(f"O arquivo '{nome_arquivo}' foi criado no diretório: {os.getcwd()}")
-    except IOError as e:
-        print(f"Erro ao salvar o arquivo JSON: {e}")
     except Exception as e:
-        print(f"Ocorreu um erro inesperado ao salvar o arquivo: {e}")
+        print(f"[ERRO] Falha ao salvar {nome_arquivo}: {e}")
 
-def remover_acentos(texto):
-    """
-    Remove acentos de uma string para facilitar a comparação.
-    """
-    if not isinstance(texto, str):
-        return texto
-    texto = re.sub(r'[ÁÀÂÃÄ]', 'A', texto)
-    texto = re.sub(r'[ÉÈÊË]', 'E', texto)
-    texto = re.sub(r'[ÍÌÎÏ]', 'I', texto)
-    texto = re.sub(r'[ÓÒÔÕÖ]', 'O', texto)
-    texto = re.sub(r'[ÚÙÛÜ]', 'U', texto)
-    texto = re.sub(r'[Ç]', 'C', texto)
-    texto = re.sub(r'[áàâãä]', 'a', texto)
-    texto = re.sub(r'[éèêë]', 'e', texto)
-    texto = re.sub(r'[íìîï]', 'i', texto)
-    texto = re.sub(r'[óòôõö]', 'o', texto)
-    texto = re.sub(r'[úùûü]', 'u', texto)
-    texto = re.sub(r'[ç]', 'c', texto)
-    return texto
+def carregar_json(nome_arquivo):
+    if not os.path.exists(nome_arquivo): return None
+    try:
+        with open(nome_arquivo, 'r', encoding='utf-8') as f: return json.load(f)
+    except: return None
 
-# --- Funções de Busca e Filtro para a Câmara ---
-
-# --- FUNÇÃO DE FILTRO SEMÂNTICO (Modificada para retornar score) ---
-def filtrar_proposicoes_por_semantica(lista_proposicoes, consulta, coluna_texto="ementa",
-                                      top_k=20, modelo="all-MiniLM-L6-v2", threshold=None):
-    """
-    Filtra proposições com base na similaridade semântica da ementa em relação à consulta.
-    Retorna uma lista de dicionários [{'id': <id>, 'score': <similaridade>}]
-    """
-
-    if not lista_proposicoes or not isinstance(lista_proposicoes, list):
-        print("Nenhuma proposição válida recebida.")
-        return []
-
-    # 1. Cria DataFrame
-    df = pd.DataFrame(lista_proposicoes)
-
-    if coluna_texto not in df.columns:
-        print(f"Aviso: Coluna '{coluna_texto}' não encontrada em todas as proposições. Usando valores nulos.")
-        if coluna_texto not in df.columns:
-            df[coluna_texto] = ""
-
-    textos = df[coluna_texto].fillna("").astype(str).tolist()
-
-    # 2. Gera embeddings
-    print(f"\nGerando embeddings para {len(textos)} textos...")
-    model = SentenceTransformer(modelo)
-    emb_textos = model.encode(textos, batch_size=32, show_progress_bar=True)
-
-    # 3. Calcula similaridade da query com todas as ementas
-    print(f"Calculando similaridade com a consulta: '{consulta}'")
-    emb_query = model.encode(consulta, convert_to_tensor=True)
-    sims = util.cos_sim(emb_query, emb_textos)[0].cpu().numpy()
-
-    # 4. Seleciona (aplica threshold primeiro, depois top_k se houver)
-    indices_ordenados = np.argsort(-sims)
-    
-    indices_filtrados = indices_ordenados
-    if threshold is not None:
-        indices_filtrados = [i for i in indices_ordenados if sims[i] >= threshold]
-        print(f"Encontrados {len(indices_filtrados)} resultados acima do threshold ({threshold}).")
-    else:
-        print(f"Nenhum threshold aplicado.")
-
-    # Aplica o limite top_k (se top_k não for None)
-    if top_k is not None:
-        indices_finais = indices_filtrados[:top_k]
-        print(f"Selecionando TOP {top_k} (ou menos, se filtrado pelo threshold).")
-    else:
-        indices_finais = indices_filtrados # <--- MUDANÇA: Usa todos os filtrados se top_k for None
-        print(f"Sem limite de TOP K. Selecionando todos os {len(indices_finais)} resultados acima do threshold.")
-
-
-    # 5. Pega IDs e SCORES correspondentes
-    if "id" not in df.columns:
-        raise ValueError("Erro crítico: Campo 'id' não encontrado nas proposições.")
-
-    # --- MUDANÇA AQUI: Retorna dict com ID e Score ---
-    resultados_filtrados = []
-    for i in indices_finais:
-        resultados_filtrados.append({
-            'id': df.iloc[i]["id"],
-            'score': float(sims[i]) # Adiciona o score de similaridade
-        })
-
-    # Debug opcional
-    print("\nProposições mais próximas (TOP 5 da lista final):")
-    for i in indices_finais[:5]:
-        ementa_preview = df.iloc[i][coluna_texto]
-        if ementa_preview:
-            ementa_preview = ementa_preview[:80] + "..."
-        else:
-            ementa_preview = "[Ementa Vazia]"
-        print(f"- ID: {df.iloc[i]['id']} | Sim: {sims[i]:.3f} | Ementa: {ementa_preview}")
-
-    print(f"\nTotal de proposições filtradas: {len(resultados_filtrados)}")
-    return resultados_filtrados
-    # --- FIM DA MUDANÇA NA FUNÇÃO ---
-
-
-def obter_proposicoes_camara_por_data(base_url, data_inicio_apresentacao=None, data_fim_apresentacao=None, siglas_tipo=None, atraso_entre_paginas=0.1):
-    """
-    Obtém proposições da API da Câmara dos Deputados... (função sem alteração)
-    """
+def obter_lista_ids(session, base_url, dt_inicio, dt_fim, tipos):
     proposicoes = []
-    url_inicial = f"{base_url}/proposicoes"
-    
-    current_params = {
-        "itens": 100,
-        "ordem": "ASC",
-        "ordenarPor": "id"
-    } 
-    
-    if data_inicio_apresentacao:
-        current_params["dataApresentacaoInicio"] = data_inicio_apresentacao
-    if data_fim_apresentacao:
-        current_params["dataApresentacaoFim"] = data_fim_apresentacao
-    
-    if siglas_tipo and isinstance(siglas_tipo, list):
-        current_params["siglaTipo"] = ",".join(siglas_tipo)
+    curr = dt_inicio
+    print(f"\n[COLETA] Buscando IDs de {dt_inicio.date()} até {dt_fim.date()}...", flush=True)
 
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
-
-    current_url = url_inicial
-    
-    print(f"Buscando lista de proposições da Câmara com filtros: {current_params}")
-    
-    while current_url:
-        for attempt in range(3):
+    while curr < dt_fim:
+        next_date = curr + timedelta(days=60) # Blocos de 60 dias para evitar timeout
+        if next_date > dt_fim: next_date = dt_fim
+        
+        dt_ini_str = curr.strftime("%Y-%m-%d")
+        dt_fim_str = next_date.strftime("%Y-%m-%d")
+        
+        url = f"{base_url}/proposicoes"
+        params = {
+            "dataApresentacaoInicio": dt_ini_str,
+            "dataApresentacaoFim": dt_fim_str,
+            "siglaTipo": ",".join(tipos),
+            "itens": 100, "ordem": "ASC", "ordenarPor": "id"
+        }
+        
+        while url:
             try:
-                response = requests.get(current_url, params=current_params if current_url == url_inicial else None, headers=headers)
-                response.raise_for_status()
-                data = response.json()
+                r = session.get(url, params=params, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+                proposicoes.extend(data.get('dados', []))
                 
-                if 'dados' in data and isinstance(data['dados'], list):
-                    proposicoes.extend(data['dados'])
-                else:
-                    print("Estrutura da resposta da API da Câmara para proposições inesperada ou lista vazia.")
-                    current_url = None
-                    break
-                
-                next_link = None
-                for link in data.get('links', []):
-                    if link.get('rel') == 'next':
-                        next_link = link.get('href')
-                        break
-                
-                current_url = next_link
-                
-                if next_link:
-                    paginas_coletadas = len(proposicoes) // current_params.get('itens', 1) if current_params.get('itens', 0) > 0 else 0
-                    print(f"  Página {paginas_coletadas + 1} de proposições coletada. Total até agora: {len(proposicoes)}")
-                    time.sleep(atraso_entre_paginas)
-                
-                break
-            
-            except requests.exceptions.RequestException as e:
-                print(f"  Erro na requisição (Tentativa {attempt + 1}/3): {e}")
-                if attempt < 2:
-                    time.sleep(5)
-                else:
-                    print(f"    Falha após 3 tentativas. Parando a coleta para esta data.")
-                    current_url = None 
-                    break 
-            except json.JSONDecodeError:
-                print("  Erro ao decodificar JSON da lista de proposições da Câmara. Parando a coleta.")
-                current_url = None
-                break
+                next_link = next((l['href'] for l in data.get('links', []) if l['rel'] == 'next'), None)
+                url = next_link
+                params = None 
             except Exception as e:
-                print(f"  Ocorreu um erro inesperado: {e}. Parando a coleta.")
-                current_url = None
+                print(f"    Erro na paginação: {e}")
                 break
-            
-    print(f"Total final de proposições básicas encontradas no período: {len(proposicoes)}")
-    return proposicoes
+        curr = next_date + timedelta(days=1)
+    
+    # Remove duplicatas
+    unicos = {p['id']: p for p in proposicoes}.values()
+    return list(unicos)
 
+def executar_coleta_completa():
+    ids_salvos = carregar_json(NOME_ARQUIVO_CACHE_IDS)
+    session = requests.Session()
+    
+    # 1. Obter IDs (se não existir cache ou se quiser forçar atualização)
+    if not ids_salvos:
+        ids_salvos = obter_lista_ids(session, CAMARA_BASE_URL, DATA_INICIO_COLETA, DATA_FIM_COLETA, TIPOS_DOCUMENTO)
+        salvar_json(ids_salvos, NOME_ARQUIVO_CACHE_IDS)
+    else:
+        print(f"[CACHE] Usando lista de IDs existente: {len(ids_salvos)} itens.", flush=True)
 
-def buscar_detalhes_proposicoes_camara_por_ids(ids_list, base_url, atraso_entre_requisicoes=0.1):
+    # 2. Obter Detalhes + Cache Partidário
+    cache_partidos = {}
     proposicoes_detalhadas = []
-    total_ids = len(ids_list)
-    print(f"\nBuscando detalhes para {total_ids} proposições filtradas (por semântica)...")
-    for i, id_proposicao in enumerate(ids_list):
-        url_detalhes = f"{base_url}/proposicoes/{id_proposicao}"
-        print(f"  Buscando detalhes para ID {id_proposicao} ({i + 1}/{total_ids})...")
-        for attempt in range(3):
-            try:
-                response = requests.get(url_detalhes)
-                response.raise_for_status()
-                data = response.json()
-                if 'dados' in data:
-                    proposicao_detalhada = data['dados']
-                    uri_autores = proposicao_detalhada.get('uriAutores')
-                    if uri_autores:
-                        nomes_autores_lista = []
-                        autores_detalhes_lista = []
-                        try:
-                            autores_response = requests.get(uri_autores)
-                            autores_response.raise_for_status()
-                            autores_data_json = autores_response.json()
-                            if 'dados' in autores_data_json and isinstance(autores_data_json['dados'], list):
-                                for autor in autores_data_json['dados']:
-                                    autor_nome = autor.get('nome')
-                                    autor_uri_deputado = autor.get('uri')
-                                    autor_partido = 'Não Informado'
-                                    if autor_nome and autor_uri_deputado:
-                                        try:
-                                            deputado_response = requests.get(autor_uri_deputado)
-                                            deputado_response.raise_for_status()
-                                            deputado_data_json = deputado_response.json()
-                                            partido = deputado_data_json.get('dados', {}).get('ultimoStatus', {}).get('siglaPartido')
-                                            if partido:
-                                                autor_partido = partido
-                                        except requests.exceptions.RequestException:
-                                            pass
-                                    nomes_autores_lista.append(autor_nome)
-                                    autores_detalhes_lista.append({'nome': autor_nome, 'partido': autor_partido})
-                                    time.sleep(atraso_entre_requisicoes)
-                            proposicao_detalhada['autoresCompletos'] = nomes_autores_lista
-                            proposicao_detalhada['autoresDetalhes'] = autores_detalhes_lista
-                        except requests.exceptions.RequestException as e:
-                            print(f"    Erro ao buscar autores para proposição {id_proposicao}: {e}")
-                        time.sleep(atraso_entre_requisicoes) 
-                    proposicoes_detalhadas.append(proposicao_detalhada)
-                break
-            except requests.exceptions.RequestException as e:
-                print(f"  Erro na requisição de detalhes (Tentativa {attempt + 1}/3): {e}")
-                if attempt < 2:
-                    time.sleep(5)
-                else:
-                    print(f"    Falha após 3 tentativas. Pulando para a próxima proposição.")
-                    break 
-    print(f"Total de proposições detalhadas coletadas: {len(proposicoes_detalhadas)}")
+    total = len(ids_salvos)
+    
+    print("\n[COLETA] Obtendo detalhes das proposições...", flush=True)
+    for i, item in enumerate(ids_salvos):
+        prop_id = item['id']
+        
+        if (i + 1) % 50 == 0: 
+            print(f" -> Progresso: {i + 1}/{total}", flush=True)
+
+        try:
+            r = session.get(f"{CAMARA_BASE_URL}/proposicoes/{prop_id}", timeout=10)
+            if r.status_code != 200: continue
+            
+            dados = r.json().get('dados', {})
+            
+            # URL Oficial
+            dados['url_pagina_web_oficial'] = f"https://www.camara.leg.br/proposicoesWeb/fichadetramitacao?idProposicao={dados.get('id')}"
+
+            # Tratamento de Autores
+            uri_autores = dados.get('uriAutores')
+            autor_nome = "Desconhecido"
+            autor_partido = "S/P"
+            coautores = []
+
+            if uri_autores:
+                try:
+                    r_aut = session.get(uri_autores, timeout=5)
+                    lista_autores = r_aut.json().get('dados', [])
+                    
+                    if lista_autores:
+                        principal = lista_autores[0]
+                        autor_nome = principal.get('nome')
+                        uri_deputado = principal.get('uri')
+
+                        # Cache de Partido
+                        if uri_deputado:
+                            if uri_deputado in cache_partidos:
+                                autor_partido = cache_partidos[uri_deputado]
+                            else:
+                                try:
+                                    r_dep = session.get(uri_deputado, timeout=5)
+                                    d_dep = r_dep.json().get('dados', {})
+                                    autor_partido = d_dep.get('ultimoStatus', {}).get('siglaPartido', 'S/P')
+                                    cache_partidos[uri_deputado] = autor_partido
+                                except:
+                                    pass 
+                        
+                        if len(lista_autores) > 1:
+                            coautores = [a.get('nome') for a in lista_autores[1:]]
+                except:
+                    pass 
+
+            dados['autor_principal_nome'] = autor_nome
+            dados['autor_principal_partido'] = autor_partido
+            dados['coautores_nomes'] = coautores
+            proposicoes_detalhadas.append(dados)
+
+        except Exception as e:
+            print(f"Erro ID {prop_id}: {e}")
+            session.close()
+            session = requests.Session()
+            time.sleep(1)
+
+    session.close()
+    salvar_json(proposicoes_detalhadas, NOME_ARQUIVO_BANCO_DADOS)
     return proposicoes_detalhadas
 
-def transform_camara_data_to_summary(raw_camara_json):
-    if not isinstance(raw_camara_json, dict) or not raw_camara_json: return None
-    id_proposicao = raw_camara_json.get('id')
-    sigla_tipo = raw_camara_json.get('siglaTipo')
-    numero = raw_camara_json.get('numero')
-    ano = raw_camara_json.get('ano')
-    ementa = raw_camara_json.get('ementa', '').strip()
-    url_inteiro_teor = raw_camara_json.get('urlInteiroTeor')
-    url_pagina_web = raw_camara_json.get('uri')
-    autores_detalhes_list = raw_camara_json.get('autoresDetalhes', [])
-    autor_principal_nome, autor_principal_partido = ('', '')
-    if autores_detalhes_list:
-        primeiro_autor = autores_detalhes_list[0]
-        autor_principal_nome = primeiro_autor.get('nome', '')
-        autor_principal_partido = primeiro_autor.get('partido', '')
-    resumo_autoria_str = "; ".join([a['nome'] for a in autores_detalhes_list if a.get('nome')])
-    indexacao_data = raw_camara_json.get('keywords', '')
-    status_proposicao = raw_camara_json.get('statusProposicao', {})
-    descricao_tramitacao_status = status_proposicao.get('descricaoTramitacao', 'Não Informado')
-    data_hora_status_tramitacao = status_proposicao.get('dataHora', None) 
-    descricao_situacao = status_proposicao.get('descricaoSituacao', 'Não Informado')
-    return {"id": id_proposicao, "codigoMateria": id_proposicao, "identificacao": f"{sigla_tipo} {numero}/{ano}" if all([sigla_tipo, numero, ano]) else id_proposicao, "sigla": sigla_tipo, "descricaoSigla": raw_camara_json.get('descricaoTipo', "N/I"), "numero": numero, "ano": ano, "casaIdentificadora": "Camara dos Deputados", "siglaEnteIdentificador": "CD", "identificacaoExterna": {}, "conteudo": {"id": id_proposicao, "idTipo": raw_camara_json.get('codTipo'), "siglaTipo": sigla_tipo, "tipo": raw_camara_json.get('descricaoTipo'), "ementa": ementa}, "documento": {"id": id_proposicao, "siglaTipo": sigla_tipo, "tipo": raw_camara_json.get('descricaoTipo'), "dataApresentacao": raw_camara_json.get('dataApresentacao'), "indexacao": indexacao_data, "url": url_inteiro_teor, "autoria": autores_detalhes_list, "resumoAutoria": resumo_autoria_str, "autorPrincipal": autor_principal_nome, "partidoAutorPrincipal": autor_principal_partido}, "tramitando": descricao_tramitacao_status, "dataHoraStatusTramitacao": data_hora_status_tramitacao, "descricaoSituacao": descricao_situacao, "urlPaginaWeb": url_pagina_web, "classificacoes": [], "autoriaIniciativa": []}
-
-def salvar_para_csv(dados_json, nome_arquivo):
-    # --- MUDANÇA AQUI: Adicionada "Similaridade Semantica" ---
-    colunas_mapeamento = {
-        "Norma": "identificacao", 
-        "Descricao da Sigla": "descricaoSigla", 
-        "Data de Apresentacao": "documento.dataApresentacao", 
-        "Autor": "documento.autorPrincipal", 
-        "Partido": "documento.partidoAutorPrincipal", 
-        "Ementa": "conteudo.ementa", 
-        "Similaridade Semantica": "similaridade", # <--- NOVA COLUNA
-        "Link Documento PDF": "documento.url", 
-        "Link Página Web": "urlPaginaWeb", 
-        "Indexacao": "documento.indexacao", 
-        "Último Estado": "tramitando", 
-        "Data Último Estado": "dataHoraStatusTramitacao", 
-        "Situação": "descricaoSituacao"
-    }
-    # --- FIM DA MUDANÇA ---
-
-    fieldnames = list(colunas_mapeamento.keys())
-    try:
-        with open(nome_arquivo, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            for item in dados_json:
-                row = {}
-                for csv_col, json_path in colunas_mapeamento.items():
-                    value = item
-                    for part in json_path.split('.'):
-                        if isinstance(value, dict): value = value.get(part, None)
-                        else: value = None; break
-                    if ("Data" in csv_col) and value and isinstance(value, str):
-                        value = value.split('T')[0]
-                    # Formata o score para 3 casas decimais se for a coluna de similaridade
-                    if csv_col == "Similaridade Semantica" and isinstance(value, float):
-                         value = f"{value:.3f}"
-                    row[csv_col] = str(value) if value is not None else ''
-                writer.writerow(row)
-        print(f"\nDados salvos com sucesso em '{nome_arquivo}'")
-    except IOError as e: print(f"Erro ao salvar o arquivo CSV: {e}")
-
-
-#------------------ A PARTIR DAQUI É POSSÍVEL FAZER ALTERAÇÕES ----------------------------------
-
-# --- Configurações e Execução Principal ---      
-CAMARA_BASE_URL = "https://dadosabertos.camara.leg.br/api/v2"
-
-# --- PARÂMETROS DE FILTRO ATUALIZADOS ---
-CONSULTA_SEMANTICA_CAMARA = "Projetos de lei sobre inteligência artificial e internet"
-FILTRO_TOP_K = None                 # <--- MUDANÇA: None = Sem limite, pega todos acima do threshold
-FILTRO_THRESHOLD = 0.45             # <--- MUDANÇA: Filtra por 50% de similaridade
-# --------------------------------------
-
-TIPOS_DOCUMENTO_SIGLAS = ["PL", "PLP", "PEC"]
-NOME_ARQUIVO_SAIDA_FINAL_FORMATADO_JSON_CAMARA = "proposicoes_camara_final_formatado.json" 
-NOME_ARQUIVO_SAIDA_FINAL_CSV_CAMARA = "proposicoes_camara_resumo.csv"
-NOME_ARQUIVO_PROPOSICOES_BASICAS_BRUTAS_JSON_CAMARA = "proposicoes_camara_basicas_brutas.json" 
-NOME_ARQUIVO_PROPOSICOES_DETALHADAS_BRUTAS_JSON_CAMARA = "proposicoes_camara_detalhadas_brutas.json"
-
-if __name__ == "__main__":
-    print("--- INICIANDO COLETA DE DADOS DA CÂMARA DOS DEPUTADOS ---")
-
-    data_inicio_geral = datetime(2021, 1, 1)  #DATA DE APRESENTAÇÃO
-    data_fim_limite = datetime(2021, 12, 1)
-
-#------------------ A PARTIR DAQUI NÃO É MAIS POSSÍVEL FAZER ALTERAÇÕES ------------------------
-
-    all_proposicoes_basicas_coletadas = []
+# =============================================================================
+# 4. MÓDULO DE KEYWORDS (Lógica do gerador_keywords.py)
+# =============================================================================
+def gerar_keywords_embeddings(db_dados, model):
+    print("\n[KEYWORDS] Gerando embeddings das palavras-chave...", flush=True)
     
-    current_start_date = data_inicio_geral
-    while current_start_date < data_fim_limite:
-        # Calcula o fim do período (3 meses à frente)
-        month = current_start_date.month + 3
-        year = current_start_date.year
-        if month > 12:
-            month -= 12
-            year += 1
-        
-        # O fim do período é um dia antes do início do próximo período de 3 meses
-        end_of_period = datetime(year, month, 1) - timedelta(days=1)
-        
-        # Garante que o fim do período não ultrapasse o limite total
-        if end_of_period > data_fim_limite:
-            end_of_period = data_fim_limite
+    # Palavras que aparecem no campo 'keywords' da Câmara mas não ajudam
+    BLACKLIST = {"projeto", "lei", "sobre", "alteracao", "criacao", "instituicao", "federal", "nacional"}
+    unique_keywords = set()
+    
+    for projeto in db_dados:
+        texto = projeto.get('keywords') or projeto.get('indexacao')
+        if texto:
+            termos = texto.replace(';', ',').split(',')
+            for termo in termos:
+                # Usa a função de limpeza simples para keywords
+                t_limpo = limpar_texto_basico(termo).upper()
+                if len(t_limpo) > 3 and t_limpo.lower() not in BLACKLIST:
+                    unique_keywords.add(t_limpo)
+    
+    lista_keywords = sorted(list(unique_keywords))
+    
+    # Vetorização
+    embeddings = model.encode(lista_keywords, batch_size=64, show_progress_bar=True, convert_to_tensor=True)
+    
+    dados_pkl = {"keywords_texto": lista_keywords, "keywords_vectors": embeddings.cpu()}
+    with open(NOME_ARQUIVO_PKL, "wb") as f:
+        pickle.dump(dados_pkl, f)
+    
+    return dados_pkl
 
-        data_inicio_str = current_start_date.strftime("%Y-%m-%d")
-        data_fim_str = end_of_period.strftime("%Y-%m-%d")
+# =============================================================================
+# 5. MÓDULO FILTRADOR (Lógica do filtrador_v3_final.py)
+# =============================================================================
+def extrair_metadados_para_csv(p):
+    # Tratamento de Autores
+    autor_principal = p.get('autor_principal_nome')
+    coautores = p.get('coautores_nomes')
+    
+    lista_autores = []
+    if autor_principal: lista_autores.append(str(autor_principal))
+    if coautores:
+        if isinstance(coautores, list): lista_autores.extend([str(c) for c in coautores])
+        elif isinstance(coautores, str): lista_autores.append(coautores)
+    
+    autores_finais = list(dict.fromkeys(lista_autores)) # Remove duplicatas
 
-        print(f"\n--- Coletando dados para o período: {data_inicio_str} a {data_fim_str} ---")
-        
-        proposicoes_do_periodo = obter_proposicoes_camara_por_data(
-            CAMARA_BASE_URL,
-            data_inicio_apresentacao=data_inicio_str,
-            data_fim_apresentacao=data_fim_str,
-            siglas_tipo=TIPOS_DOCUMENTO_SIGLAS
-        )
-        
-        if proposicoes_do_periodo:
-            all_proposicoes_basicas_coletadas.extend(proposicoes_do_periodo)
-            print(f"Total acumulado de proposições básicas coletadas: {len(all_proposicoes_basicas_coletadas)}")
-        else:
-            print(f"Nenhuma proposição encontrada no período.")
-        
-        # Define o início do próximo período
-        current_start_date = end_of_period + timedelta(days=1)
-        time.sleep(1) 
+    # Tratamento de Status
+    status = p.get('statusProposicao')
+    ultimo_estado = ""
+    data_ultimo = ""
+    situacao = ""
+    
+    if isinstance(status, dict):
+        ultimo_estado = status.get('descricaoTramitacao', '') or status.get('despacho', '')
+        data_ultimo = status.get('dataHora', '') or status.get('data', '')
+        situacao = status.get('descricaoSituacao', '')
 
-    print(f"\n--- Coleta de todas as proposições básicas concluída. Total: {len(all_proposicoes_basicas_coletadas)} ---")
+    return {
+        "autores": ", ".join(autores_finais) if autores_finais else "Não informado",
+        "partido": p.get('autor_principal_partido', ''),
+        "ultimo_estado": ultimo_estado,
+        "data_ultimo": data_ultimo,
+        "situacao": situacao
+    }
 
-    if all_proposicoes_basicas_coletadas:
-        salvar_para_json(all_proposicoes_basicas_coletadas, NOME_ARQUIVO_PROPOSICOES_BASICAS_BRUTAS_JSON_CAMARA)
-
-        # --- CHAMADA DA FUNÇÃO ATUALIZADA ---
-        # Agora recebe uma lista de dicts: [{'id': 1, 'score': 0.8}, ...]
-        resultados_filtrados_semantica = filtrar_proposicoes_por_semantica( # <--- MUDANÇA
-            lista_proposicoes=all_proposicoes_basicas_coletadas, 
-            consulta=CONSULTA_SEMANTICA_CAMARA,
-            coluna_texto="ementa", 
-            top_k=FILTRO_TOP_K,
-            threshold=FILTRO_THRESHOLD
-        )
-        # ------------------------------------
-        
-        if resultados_filtrados_semantica: # <--- MUDANÇA
-            
-            # <--- MUDANÇA: Criar mapa de scores e lista de IDs
-            ids_para_buscar = [item['id'] for item in resultados_filtrados_semantica]
-            mapa_scores = {item['id']: item['score'] for item in resultados_filtrados_semantica}
-            # --- FIM DA MUDANÇA ---
-
-            proposicoes_detalhadas_filtradas_ementa = buscar_detalhes_proposicoes_camara_por_ids(
-                ids_para_buscar, CAMARA_BASE_URL # <--- MUDANÇA: Passa a lista de IDs extraída
-            )
-            
-            if proposicoes_detalhadas_filtradas_ementa:
-                salvar_para_json(proposicoes_detalhadas_filtradas_ementa, NOME_ARQUIVO_PROPOSICOES_DETALHADAS_BRUTAS_JSON_CAMARA)
-                proposicoes_formatadas_camara = [transform_camara_data_to_summary(p) for p in proposicoes_detalhadas_filtradas_ementa if p]
-                
-                if proposicoes_formatadas_camara:
-                    
-                    # --- MUDANÇA: Adiciona o score em cada proposição formatada ---
-                    print("Adicionando scores de similaridade aos dados formatados...")
-                    for prop in proposicoes_formatadas_camara:
-                        prop_id = prop.get('id')
-                        if prop_id in mapa_scores:
-                            prop['similaridade'] = mapa_scores[prop_id] # Adiciona o score
-                        else:
-                            prop['similaridade'] = None
-                    # --- FIM DA MUDANÇA ---
-
-                    print(f"\n--- Formatando {len(proposicoes_formatadas_camara)} proposições detalhadas ---")
-                    salvar_para_json(proposicoes_formatadas_camara, NOME_ARQUIVO_SAIDA_FINAL_FORMATADO_JSON_CAMARA)
-                    salvar_para_csv(proposicoes_formatadas_camara, NOME_ARQUIVO_SAIDA_FINAL_CSV_CAMARA)
-                    print("\nScript de coleta da Câmara dos Deputados concluído com sucesso!")
-                else:
-                    print("Nenhuma proposição foi formatada com sucesso.")
-            else:
-                 print("Nenhuma proposição detalhada foi encontrada.")
-        else:
-            print("Nenhuma proposição encontrada com os critérios semânticos especificados.")
+def executar_filtragem(db, kw_data, model):
+    print(f"\n[FILTRO] Iniciando busca híbrida: '{CONSULTA_USUARIO}'", flush=True)
+    
+    # A) Prepara Embeddings das Ementas (Cache)
+    if os.path.exists(ARQUIVO_CACHE_EMB) and os.path.getsize(ARQUIVO_CACHE_EMB) > 0:
+        try:
+            embs_ementas = np.load(ARQUIVO_CACHE_EMB)
+            # Verifica se o tamanho do cache bate com o DB atual
+            if len(embs_ementas) != len(db): 
+                raise ValueError("Tamanho do cache diferente do DB")
+            print(" -> Cache de ementas carregado.", flush=True)
+        except:
+            print(" -> Gerando embeddings das ementas (Atualizando)...", flush=True)
+            textos = [limpar_ementa_para_vetorizacao(p.get('ementa', '')) for p in db]
+            embs_ementas = model.encode(textos, batch_size=32, show_progress_bar=True)
+            np.save(ARQUIVO_CACHE_EMB, embs_ementas)
     else:
-        print("Não foi possível obter a lista geral de proposições. Encerrando.")
+        print(" -> Gerando embeddings das ementas (Primeira vez)...", flush=True)
+        textos = [limpar_ementa_para_vetorizacao(p.get('ementa', '')) for p in db]
+        embs_ementas = model.encode(textos, batch_size=32, show_progress_bar=True)
+        np.save(ARQUIVO_CACHE_EMB, embs_ementas)
+
+    # B) Prepara Embeddings da Query e Keywords Boost
+    emb_query = model.encode(limpar_ementa_para_vetorizacao(CONSULTA_USUARIO), convert_to_tensor=True)
+    scores_kw = util.cos_sim(emb_query, kw_data['keywords_vectors'])[0]
+    top_kw = torch.topk(scores_kw, k=30)
+    
+    tags_alvo = []
+    for sc, idx in zip(top_kw.values, top_kw.indices):
+        if float(sc) > 0.65:
+            tags_alvo.append(kw_data['keywords_texto'][idx])
+
+    print(f" -> Tags de Boost identificadas: {tags_alvo[:5]}...", flush=True)
+
+    # C) Cálculo de Similaridade
+    sim_scores = util.cos_sim(emb_query, embs_ementas)[0].numpy()
+    resultados = []
+
+    for i, p in enumerate(db):
+        score_sem = float(sim_scores[i])
+        score_boost = 0.0
+        
+        # Boost se tiver tag relevante
+        raw_tags = (p.get('keywords') or '') + ' ' + (p.get('indexacao') or '')
+        # Limpeza simples para comparar com tags
+        p_tags_upper = limpar_texto_basico(raw_tags).upper()
+        
+        for tag in tags_alvo:
+            if tag in p_tags_upper:
+                score_boost = 1.0
+                break
+        
+        final_score = (score_sem * PESO_SEMANTICO) + (score_boost * PESO_KEYWORD)
+        
+        if final_score >= FILTRO_THRESHOLD:
+            meta = extrair_metadados_para_csv(p)
+            
+            # Formatação para o CSV
+            resultados.append({
+                "Norma": f"{p.get('siglaTipo')} {p.get('numero')}/{p.get('ano')}",
+                "Similaridade Semantica": f"{final_score:.4f}",
+                "Descricao da Sigla": p.get('descricaoTipo', p.get('siglaTipo', '')),
+                "Data de Apresentacao": p.get('dataApresentacao', '')[:10],
+                "Autor": meta['autores'],
+                "Partido": meta['partido'],
+                "Ementa": p.get('ementa', '').strip(),
+                "Link Documento PDF": p.get('urlInteiroTeor', ''),
+                "Link Página Web": p.get('url_pagina_web_oficial', ''),
+                "Indexacao": p.get('keywords', p.get('indexacao', '')),
+                "Último Estado": meta['ultimo_estado'],
+                "Data Último Estado": meta['data_ultimo'][:10],
+                "Situação": meta['situacao']
+            })
+
+    # D) Salvar CSV
+    if resultados:
+        colunas = list(resultados[0].keys())
+        # IMPORTANTE: Delimitador vírgula para compatibilidade com insert_data.py
+        with open(NOME_ARQUIVO_SAIDA_FINAL_CSV, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=colunas, delimiter=',') 
+            writer.writeheader()
+            writer.writerows(resultados)
+        print(f"\n[SUCESSO] Arquivo '{NOME_ARQUIVO_SAIDA_FINAL_CSV}' gerado com {len(resultados)} linhas.", flush=True)
+    else:
+        print("\n[AVISO] Nenhum resultado encontrado com os filtros atuais.", flush=True)
+
+# =============================================================================
+# 6. ORQUESTRAÇÃO PRINCIPAL (MAIN)
+# =============================================================================
+if __name__ == "__main__":
+    print("--- INICIANDO SISTEMA UNIFICADO DE COLETA E FILTRAGEM (OASIS) ---", flush=True)
+    
+    # 1. Carrega ou Coleta Dados
+    db_dados = carregar_json(NOME_ARQUIVO_BANCO_DADOS)
+    if not db_dados:
+        db_dados = executar_coleta_completa()
+    else:
+        print(f"[DB] Base de dados carregada: {len(db_dados)} registros.", flush=True)
+
+    # 2. Prepara Modelo
+    print(f"\n[MODELO] Carregando {MODELO_NOME}...", flush=True)
+    model = SentenceTransformer(MODELO_NOME)
+
+    # 3. Gera ou Carrega Keywords
+    kw_data = None
+    if os.path.exists(NOME_ARQUIVO_PKL):
+        try:
+            with open(NOME_ARQUIVO_PKL, 'rb') as f: kw_data = pickle.load(f)
+        except: pass
+    
+    if not kw_data:
+        kw_data = gerar_keywords_embeddings(db_dados, model)
+
+    # 4. Filtra e Exporta CSV
+    executar_filtragem(db_dados, kw_data, model)
+    
+    print("\n--- PROCESSO FINALIZADO ---", flush=True)
