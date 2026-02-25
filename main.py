@@ -1,20 +1,11 @@
 import subprocess
 import os
-import shutil
 import mysql.connector
 import sys
-import time
 import config
-
 
 # --- CONFIGURAÇÃO GLOBAL DE CAMINHOS ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# --- CONFIGURAÇÃO DO BANCO DE DADOS ---
-DB_HOST = config.HOST
-DB_USER = config.USUARIO
-DB_PASSWORD = config.SENHA
-DB_NAME = config.NOME
 
 def obter_caminho(nome_arquivo):
     """Retorna o caminho completo compatível com o sistema operacional"""
@@ -29,122 +20,116 @@ def garantir_estrutura_pastas():
     if not os.path.exists(pasta_csv):
         try:
             os.makedirs(pasta_csv)
-            print(f"Pasta criada: {pasta_csv}")
+            print(f"Pasta criada com sucesso: {pasta_csv}")
         except OSError as e:
             print(f"Erro ao criar pasta: {e}")
     else:
         print(f"Pasta já existe: {pasta_csv}")
 
 def executar_api():
-    print("\n>>> [1/4] Coletando dados da API (acess_api.py)...")
-    
+    print("\n>>> [1/4] Executando o Pipeline de IA (acess_api.py)...")
     script_path = obter_caminho("acess_api.py")
-    
-    # Executa o script
-    subprocess.run([sys.executable, script_path], check=True, cwd=BASE_DIR)
-    
-    # Movimentação do arquivo
-    arquivo_gerado = obter_caminho("proposicoes_camara_resumo.csv")
-    pasta_destino = obter_caminho("projetos_em_csv")
-    destino_final = os.path.join(pasta_destino, "proposicoes_camara_resumo.csv")
-    
-    if os.path.exists(arquivo_gerado):
-        # Remove versão antiga se existir para evitar conflito
-        if os.path.exists(destino_final):
-            os.remove(destino_final)
-
-        shutil.move(arquivo_gerado, destino_final)
-        print(f"Arquivo CSV movido para: {destino_final}")
-    else:
-        print("AVISO: O arquivo CSV não foi gerado pela API (ou foi salvo em outro lugar).")
+    try:
+        subprocess.run([sys.executable, script_path], check=True, cwd=BASE_DIR)
+    except subprocess.CalledProcessError:
+        print("[ERRO] Falha ao executar a coleta e filtragem de dados.")
+        sys.exit(1)
 
 def recriar_banco():
-    print("\n>>> [2/4] Recriando Banco de Dados (create_database.sql)...")
+    print("\n>>> [2/4] Recriando banco de dados a partir do SQL (create_database.sql)...")
+    sql_file = obter_caminho("create_database.sql")
     
-    arquivo_sql = obter_caminho("create_database.sql")
-
-    if not os.path.exists(arquivo_sql):
-        print(f"Erro: Arquivo não encontrado: {arquivo_sql}")
-        return
-
-    with open(arquivo_sql, "r", encoding="utf-8") as f:
-        sql_script = f.read()
-
     try:
         cnx = mysql.connector.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD
+            user=config.USUARIO,
+            password=config.SENHA,
+            host=config.HOST
         )
         cursor = cnx.cursor()
         
-        commands = sql_script.split(';')
+        with open(sql_file, 'r', encoding='utf-8') as file:
+            sql_script = file.read()
+            
+        sql_commands = sql_script.split(';')
         
-        for command in commands:
+        for command in sql_commands:
             if command.strip():
                 try:
                     cursor.execute(command)
                 except mysql.connector.Error as err:
-                    # Ignora erro se tentar apagar banco que não existe
-                    if err.errno == 1008: 
+                    if err.errno == 1007: # Ignora erro de "banco já existe" se acontecer
                         pass
                     else:
-                        print(f"Erro SQL: {err}")
+                        print(f"Erro ao executar comando SQL: {err}")
                         raise err
-            
+                        
         cnx.commit()
         cursor.close()
         cnx.close()
         print("Banco de dados 'Oasis' recriado com sucesso.")
     except mysql.connector.Error as err:
-        print(f"Erro crítico de conexão ao MySQL: {err}")
-        # Não usamos sys.exit aqui para permitir que o usuário veja o erro no final
-        raise err
+        print(f"Erro crítico no banco: {err}. Verifique se o MySQL está rodando e a senha no config.py.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Erro ao ler o arquivo SQL: {e}")
+        sys.exit(1)
 
 def inserir_dados():
-    print("\n>>> [3/4] Inserindo dados no SQL (insert_data.py)...")
+    print("\n>>> [3/4] Inserindo dados filtrados no SQL (insert_data.py)...")
     script_path = obter_caminho("insert_data.py")
-    
-    subprocess.run([sys.executable, script_path], check=True, cwd=BASE_DIR)
+    try:
+        subprocess.run([sys.executable, script_path], check=True, cwd=BASE_DIR)
+    except subprocess.CalledProcessError:
+        print("Erro ao inserir dados. Verifique o arquivo insert_data.py.")
+        sys.exit(1)
 
 def abrir_dashboard():
     print("\n>>> [4/4] Iniciando Dashboard (Streamlit)...")
     print("---------------------------------------------------------")
     print("O navegador deve abrir automaticamente.")
-    print("Para parar, feche esta janela ou pressione Ctrl+C.")
+    print("Para parar o servidor, pressione Ctrl+C neste terminal.")
     print("---------------------------------------------------------")
     
     dashboard_path = obter_caminho("dashboard.py")
     
-    # Garante que estamos usando 'python.exe' (com janela) e não 'pythonw.exe' (sem janela)
+    # Garante que estamos usando 'python.exe' para ver os logs no Windows
     executavel_python = sys.executable.replace("pythonw.exe", "python.exe")
     
-    subprocess.run([executavel_python, "-m", "streamlit", "run", dashboard_path], check=True, cwd=BASE_DIR)
+    try:
+        subprocess.run([executavel_python, "-m", "streamlit", "run", dashboard_path], check=True, cwd=BASE_DIR)
+    except KeyboardInterrupt:
+        print("\nServidor do Dashboard encerrado pelo usuário.")
+
+def garantir_estrutura_pastas():
+    print("\n>>> [0/4] Verificando estrutura de pastas...")
+    pastas = [config.PASTA_DADOS, config.PASTA_CSV]
+    
+    for pasta in pastas:
+        if not os.path.exists(pasta):
+            os.makedirs(pasta)
+            print(f"Pasta criada: {pasta}")
+        else:
+            print(f"Pasta pronta: {pasta}")
 
 if __name__ == "__main__":
     try:
-        print(f"--- INICIANDO PIPELINE DE DADOS OASIS ---")
-
+        print(f"--- INICIANDO PROJETO OASIS COMPLETO ---")
         print(f"Diretório base: {BASE_DIR}")
         
-        # 0. Estrutura
+        # 0. Garante que as pastas existam
         garantir_estrutura_pastas()
         
-        # 1. Coleta
+        # 1. Coleta, Vetoriza e Filtra (Pipeline Híbrido)
         executar_api()
         
-        # 2. Banco
+        # 2. Reseta as Tabelas do Banco
         recriar_banco()
         
-        # 3. Inserção
+        # 3. Insere o CSV Limpo no Banco
         inserir_dados()
         
-        # 4. Dashboard
+        # 4. Sobe a Interface Web
         abrir_dashboard()
         
     except Exception as e:
-        print("\n\n#################################################")
-        print("OCORREU UM ERRO DURANTE A EXECUÇÃO")
-        print(f"Erro: {e}")
-        print("#################################################")
-        input("\nPressione ENTER para fechar a janela...")
+        print(f"Ocorreu um erro fatal na execução principal: {e}")

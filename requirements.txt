@@ -1,7 +1,0 @@
-requests
-numpy
-pandas
-sentence-transformers
-mysql-connector-python
-streamlit
-plotly

@@ -9,12 +9,12 @@ import config
 # 1) CONFIGURAÇÃO BÁSICA DO APP
 # ==============================================
 st.set_page_config(
-    page_title="Dashboard dos Projetos de Lei",
+    page_title="Dashboard OASIS",
     layout="wide"
 )
 
-st.title("Dashboard dos Projetos de Lei da Câmara dos Deputados - OASIS")
-
+st.title("🏛️ Dashboard dos Projetos de Lei - IA OASIS")
+st.markdown("Visualização das proposições filtradas e classificadas pela Inteligência Artificial.")
 
 # ==============================================
 # 2) CONEXÃO E FUNÇÕES AUXILIARES
@@ -37,275 +37,132 @@ def load_distinct_values(coluna):
     WHERE {coluna} IS NOT NULL AND {coluna} <> ''
     ORDER BY {coluna};
     """
-    df = load_data(query)
-    return df[coluna].tolist()
+    try:
+        df = load_data(query)
+        return ["Todos"] + df[coluna].tolist()
+    except:
+        return ["Todos"]
 
 @st.cache_data
 def load_min_date():
-    query = """
-    SELECT MIN(datadeapresentacao) AS min_date
-    FROM Projetos
-    WHERE datadeapresentacao IS NOT NULL;
-    """
-    df = load_data(query)
-    return df["min_date"].iloc[0]
-
-@st.cache_data
-def load_max_date():
-    query = """
-    SELECT MAX(datadeapresentacao) AS max_date
-    FROM Projetos
-    WHERE datadeapresentacao IS NOT NULL;
-    """
-    df = load_data(query)
-    return df["max_date"].iloc[0]
-
+    query = "SELECT MIN(datadeapresentacao) AS min_date FROM Projetos;"
+    try:
+        df = load_data(query)
+        if not df.empty and pd.notnull(df.iloc[0]['min_date']):
+            return df.iloc[0]['min_date']
+    except:
+        pass
+    return date(2000, 1, 1)
 
 # ==============================================
 # 3) SIDEBAR — FILTROS
 # ==============================================
-st.sidebar.header("⚙️ Filtros")
+st.sidebar.header("⚙️ Filtros do Painel")
 
-data_inicio = st.sidebar.date_input(
-    "Data inicial",
-    value=load_min_date()
-)
+# Carrega opções dinâmicas do banco
+partidos_disponiveis = load_distinct_values("partido")
+partido_filtro = st.sidebar.selectbox("Partido do Autor", partidos_disponiveis)
 
-data_fim = st.sidebar.date_input(
-    "Data final",
-    value=load_max_date()
-)
+situacoes_disponiveis = load_distinct_values("situacao")
+situacao_filtro = st.sidebar.selectbox("Situação da Proposição", situacoes_disponiveis)
 
-lista_partidos = load_distinct_values("partido")
-lista_situacoes = load_distinct_values("situacao")
+keyword = st.sidebar.text_input("Palavra-chave extra (Opcional)")
 
-partido_filtro = st.sidebar.multiselect("Partido", lista_partidos)
-situacao_filtro = st.sidebar.multiselect("Situação", lista_situacoes)
+min_data_db = load_min_date()
+data_inicio = st.sidebar.date_input("Data Início", min_data_db)
+data_fim = st.sidebar.date_input("Data Fim", date.today())
 
-keyword = st.sidebar.text_input("Palavra-chave (ementa / indexação)")
-
-st.sidebar.markdown("---")
-
-st.sidebar.subheader("📊 Gráficos")
-
-show_graf_ano = st.sidebar.checkbox("Projetos por ano", value=True)
-show_graf_partido = st.sidebar.checkbox("Projetos por partido", value=True)
-show_graf_autores = st.sidebar.checkbox("Projetos por autor", value=True)
-show_graf_descricao = st.sidebar.checkbox("Projetos por descrição", value=True)
-show_graf_situacao = st.sidebar.checkbox("Situação dos projetos", value=True)
-
-
-# ==============================================
-# 4) FUNÇÃO CENTRAL DE FILTROS (CAMADA SEMÂNTICA)
-# ==============================================
 def build_where_clause():
-    conditions = [
-        f"datadeapresentacao BETWEEN '{data_inicio}' AND '{data_fim}'"
-    ]
-
-    if  partido_filtro:
-        partido_filtro_sql = ", ".join(f"'{p}'" for p in partido_filtro)
-        conditions.append(f"partido IN ({partido_filtro_sql})")
-
-    if situacao_filtro:
-        situacao_filtro_sql = ", ".join(f"'{s}'" for s in situacao_filtro)
-        conditions.append(f"situacao IN ({situacao_filtro_sql})")
-
+    """Constrói a cláusula WHERE do SQL dinamicamente."""
+    clausulas = [f"datadeapresentacao BETWEEN '{data_inicio}' AND '{data_fim}'"]
+    
+    if partido_filtro != "Todos":
+        clausulas.append(f"partido = '{partido_filtro}'")
+        
+    if situacao_filtro != "Todos":
+        clausulas.append(f"situacao = '{situacao_filtro}'")
+        
     if keyword:
-        conditions.append(
-            f"(ementa LIKE '%{keyword}%' "
-            f"OR indexacao LIKE '%{keyword}%')"
-        )
-
-    return " WHERE " + " AND ".join(conditions)
-
-
-# ==============================================
-# 5) TABS
-# ==============================================
-tab_visaoGeral, tab_partidos, tab_autores, tab_temas, tab_proposicoes = st.tabs([
-    "📈 Visão Geral",
-    "🏛️ Partidos",
-    "✍️ Autores",
-    "📝 Temas",
-    "📄 Proposições"
-])
-
+        clausulas.append(f"""
+        (ementa LIKE '%{keyword}%' 
+         OR indexacao LIKE '%{keyword}%' 
+         OR descricao LIKE '%{keyword}%')
+        """)
+        
+    return "WHERE " + " AND ".join(clausulas)
 
 # ==============================================
-# TAB 1 — VISÃO GERAL
+# 4) ESTRUTURA DE ABAS
 # ==============================================
-with tab_visaoGeral:
-    st.header("📈 Visão Geral")
+tab_visao, tab_proposicoes = st.tabs(["📊 Visão Geral", "📄 Lista de Proposições"])
 
-    if show_graf_ano:
-        query = f"""
-        SELECT YEAR(datadeapresentacao) AS ano, COUNT(*) AS quantidade
-        FROM Projetos
-        {build_where_clause()}
-        GROUP BY YEAR(datadeapresentacao)
-        ORDER BY ano;
-        """
-        df = load_data(query)
+# --- ABA 1: VISÃO GERAL ---
+with tab_visao:
+    st.subheader("Métricas do Tema Filtrado")
 
-        fig = px.line(df, x="ano", y="quantidade",
-                      title="Projetos por ano", markers=True)
-        fig.update_xaxes(dtick=1)
-        st.plotly_chart(fig, use_container_width=True)
+    query_visao = f"""
+    SELECT partido, situacao, COUNT(*) as quantidade
+    FROM Projetos
+    {build_where_clause()}
+    GROUP BY partido, situacao
+    """
+    df_visao = load_data(query_visao)
 
-
-# ==============================================
-# TAB 2 — PARTIDOS
-# ==============================================
-with tab_partidos:
-    st.header("🏛️ Projetos por Partido")
-
-    if show_graf_partido:
-        query = f"""
-        SELECT partido, COUNT(*) AS quantidade
-        FROM Projetos
-        {build_where_clause()}
-        AND partido IS NOT NULL AND partido <> ''
-        GROUP BY partido
-        ORDER BY quantidade DESC;
-        """
-        df = load_data(query)
-
-        fig = px.bar(
-            df,
-            x="quantidade",
-            y="partido",
-            orientation="h",
-            title="Projetos por Partido"
-        )
-        fig.update_yaxes(autorange="reversed")
-        fig.update_layout(
-            height=800
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-
-# ==============================================
-# TAB 3 — AUTORES
-# ==============================================
-with tab_autores:
-    st.header("✍️ Projetos por Autor")
-
-    if show_graf_autores:
-        query = f"""
-        SELECT autor, COUNT(*) AS quantidade
-        FROM Projetos
-        {build_where_clause()}
-        AND autor IS NOT NULL AND autor <> ''
-        GROUP BY autor
-        ORDER BY quantidade DESC;
-        """
-        df = load_data(query)
-
-        st.dataframe(df, use_container_width=True)
-
-        df_top = df.head(20)
-        fig = px.bar(
-            df_top,
-            x="quantidade",
-            y="autor",
-            orientation="h",
-            title="Top 20 Autores"
-        )
-        fig.update_yaxes(autorange="reversed")
-        fig.update_layout(
-            height=800
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-
-# ==============================================
-# TAB 4 — TEMAS / SITUAÇÃO
-# ==============================================
-with tab_temas:
-    st.header("📝 Temas e Situação")
-
-    if show_graf_descricao:
-        query = f"""
-        SELECT descricao, COUNT(*) AS quantidade
-        FROM Projetos
-        {build_where_clause()}
-        AND descricao IS NOT NULL AND descricao <> ''
-        GROUP BY descricao
-        ORDER BY quantidade DESC;
-        """
-        df = load_data(query)
-
-        fig = px.bar(df, x="descricao", y="quantidade",
-                     title="Projetos por Descrição")
-        st.plotly_chart(fig, use_container_width=True)
-
-    if show_graf_situacao:
-        query = f"""
-        SELECT situacao, COUNT(*) AS quantidade
-        FROM Projetos
-        {build_where_clause()}
-        AND situacao IS NOT NULL AND situacao <> ''
-        GROUP BY situacao
-        ORDER BY quantidade DESC;
-        """
-        df = load_data(query)
-
+    if df_visao.empty:
+        st.warning("Nenhum dado encontrado com os filtros atuais.")
+    else:
+        total_projetos = int(df_visao['quantidade'].sum())
+        total_partidos = df_visao['partido'].nunique()
+        
         col1, col2 = st.columns(2)
+        col1.metric("Total de Projetos Relevantes (IA)", total_projetos)
+        col2.metric("Partidos Envolvidos", total_partidos)
 
-        with col1:
-            fig = px.pie(df, names="situacao", values="quantidade",
-                         hole=0.4, title="Situação dos Projetos")
-            st.plotly_chart(fig, use_container_width=True)
+        st.markdown("---")
 
-        with col2:
-            fig = px.bar(df, x="quantidade", y="situacao",
-                         orientation="h",
-                         title="Quantidade por Situação")
-            st.plotly_chart(fig, use_container_width=True)
+        col_graf1, col_graf2 = st.columns(2)
 
+        with col_graf1:
+            df_partido = df_visao.groupby('partido', as_index=False)['quantidade'].sum()
+            df_partido = df_partido.sort_values(by='quantidade', ascending=False).head(10)
+            fig1 = px.bar(df_partido, x="partido", y="quantidade",
+                         title="Top 10 Partidos com Mais Projetos",
+                         labels={"partido": "Partido", "quantidade": "Projetos"})
+            st.plotly_chart(fig1, use_container_width=True)
 
-# ==============================================
-# TAB 5 — PROPOSIÇÕES
-# ==============================================
+        with col_graf2:
+            df_sit = df_visao.groupby('situacao', as_index=False)['quantidade'].sum()
+            fig2 = px.pie(df_sit, values="quantidade", names="situacao",
+                         title="Distribuição por Situação Atual")
+            st.plotly_chart(fig2, use_container_width=True)
+
+# --- ABA 2: PROPOSIÇÕES ---
 with tab_proposicoes:
-    st.header("📄 Proposições")
+    st.subheader("Detalhamento dos Projetos")
 
-    st.markdown(
-        "Use os filtros na barra lateral e clique em **Buscar proposições**."
-    )
+    query_props = f"""
+    SELECT
+        norma as "Norma",
+        autor as "Autor",
+        partido as "Partido",
+        situacao as "Situação",
+        datadeapresentacao as "Data",
+        ementa as "Ementa",
+        linkweb as "Link"
+    FROM Projetos
+    {build_where_clause()}
+    ORDER BY datadeapresentacao DESC
+    """
+    df_props = load_data(query_props)
 
-    if st.button("🔍 Buscar proposições"):
-        query = f"""
-        SELECT
-            norma,
-            autor,
-            partido,
-            situacao,
-            datadeapresentacao,
-            ementa,
-            indexacao,
-            linkweb
-        FROM Projetos
-        {build_where_clause()}
-        ORDER BY datadeapresentacao DESC
-        """
-
-        df = load_data(query)
-
-        if df.empty:
-            st.warning("Nenhuma proposição encontrada.")
-        else:
-            st.success(f"{len(df)} proposições encontradas.")
-
-            df = df.rename(columns={
-                "norma": "Proposição",
-                "autor": "Autor",
-                "partido": "Partido",
-                "situacao": "Situação",
-                "datadeapresentacao": "Data",
-                "linkweb": "Link"
-            })
-
-            st.dataframe(df, use_container_width=True)
+    if df_props.empty:
+        st.warning("Nenhuma proposição encontrada.")
+    else:
+        st.dataframe(
+            df_props,
+            column_config={
+                "Link": st.column_config.LinkColumn("Link da Câmara")
+            },
+            use_container_width=True,
+            hide_index=True
+        )

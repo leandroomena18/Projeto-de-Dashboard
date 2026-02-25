@@ -21,4 +21,3 @@ CREATE TABLE Projetos
     dataultimo              DATE,
     situacao                VARCHAR(255)
 );
-
