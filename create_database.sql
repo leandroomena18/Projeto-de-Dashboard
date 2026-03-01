@@ -4,7 +4,6 @@ CREATE DATABASE Oasis;
 
 USE Oasis;
 
-
 CREATE TABLE Projetos
 (
     id                      INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -19,5 +18,6 @@ CREATE TABLE Projetos
     indexacao               TEXT,
     ultimoestado            VARCHAR(255),
     dataultimo              DATE,
-    situacao                VARCHAR(255)
+    situacao                VARCHAR(255),
+    score_relevancia        DECIMAL(10,4)
 );

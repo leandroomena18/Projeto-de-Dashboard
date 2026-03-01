@@ -137,11 +137,13 @@ with tab_visao:
             st.plotly_chart(fig2, use_container_width=True)
 
 # --- ABA 2: PROPOSIÇÕES ---
+# --- ABA 2: PROPOSIÇÕES ---
 with tab_proposicoes:
     st.subheader("Detalhamento dos Projetos")
 
     query_props = f"""
     SELECT
+        score_relevancia as "Relevância (IA)",
         norma as "Norma",
         autor as "Autor",
         partido as "Partido",
@@ -151,7 +153,7 @@ with tab_proposicoes:
         linkweb as "Link"
     FROM Projetos
     {build_where_clause()}
-    ORDER BY datadeapresentacao DESC
+    ORDER BY score_relevancia DESC
     """
     df_props = load_data(query_props)
 
