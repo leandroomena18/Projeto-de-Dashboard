@@ -19,7 +19,8 @@ column_map = {
     "Norma": "norma", "Descricao da Sigla": "descricao", 'Data de Apresentacao': 'datadeapresentacao',
     "Autor": "autor", "Partido": "partido", "Ementa": "ementa", "Link Documento PDF": "linkpdf",
     "Link Página Web": "linkweb", "Indexacao": "indexacao", "Último Estado": "ultimoestado",
-    "Data Último Estado": "dataultimo", "Situação": "situacao"
+    "Data Último Estado": "dataultimo", "Situação": "situacao", 
+    "Score Final": "score_relevancia" # <--- ADICIONADO AQUI
 }
 
 csv_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'projetos_em_csv', 'proposicoes_camara_resumo.csv')  #Caminho do arquivo
@@ -30,7 +31,7 @@ with open(csv_file_path, mode='r', encoding='utf-8-sig') as csvfile:
     header = next(reader) #Lista dos nomes originais
 
     # Remove a coluna 'Similaridade Semantica'
-    colunas_ignoradas = ['Score Final', 'Boost Keyword', 'Similaridade Semantica', 'raw_score']
+    colunas_ignoradas = ['Boost Keyword', 'Similaridade Semantica', 'raw_score']
     indices_remover = sorted([header.index(col) for col in colunas_ignoradas if col in header], reverse=True)
     for idx in indices_remover: header.pop(idx)
 

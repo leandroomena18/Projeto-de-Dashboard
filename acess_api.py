@@ -1,6 +1,7 @@
 import sys
 import os
 import subprocess
+import config
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -16,7 +17,12 @@ def executar_script(nome_script):
 if __name__ == "__main__":
     print("--- INICIANDO PIPELINE DE DADOS EM BLOCOS (SHARDING) ---")
     
-    executar_script("coletor_camara2.py")
+    # --- NOVA LÓGICA: O INTERRUPTOR ---
+    if config.ATUALIZAR_BASE_API:
+        executar_script("coletor_camara2.py")
+    else:
+        print("\n>>> [PULADO] Coleta da API desativada no config.py. Usando a base local já existente para máxima velocidade.")
+        
     executar_script("gerador_keywords.py")
     executar_script("filtrador_hibrido_v3_final.py")
     
