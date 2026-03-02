@@ -5,6 +5,10 @@ import plotly.express as px
 from datetime import date
 import config
 
+import glob
+import json
+import os
+
 # ==============================================
 # 1) CONFIGURAÇÃO BÁSICA DO APP
 # ==============================================
@@ -53,6 +57,38 @@ def load_min_date():
     except:
         pass
     return date(2000, 1, 1)
+
+
+@st.cache_data
+def load_base_completa():
+    """Lê todos os JSONs brutos da Câmara e transforma num DataFrame para busca rápida."""
+    padrao = os.path.join(config.PASTA_DADOS, "camara_db_leg*.json")
+    arquivos = glob.glob(padrao)
+    
+    dados_completos = []
+    for arquivo in arquivos:
+        if os.path.exists(arquivo):
+            with open(arquivo, 'r', encoding='utf-8') as f:
+                dados = json.load(f)
+                for p in dados:
+                    # Monta o número da norma (ex: PL 123/2023)
+                    norma = f"{p.get('siglaTipo', '')} {p.get('numero', '')}/{p.get('ano', '')}"
+                    
+                    # Pega a situação atual de forma segura
+                    status = p.get('statusProposicao', {})
+                    if not isinstance(status, dict): status = {}
+                    
+                    dados_completos.append({
+                        "Norma": norma,
+                        "Data de Apresentação": p.get('dataApresentacao', '')[:10] if p.get('dataApresentacao') else '',
+                        "Autor": p.get('autor_principal_nome', 'Desconhecido'),
+                        "Situação": status.get('descricaoSituacao', 'Desconhecida'),
+                        "Ementa": p.get('ementa', ''),
+                        "Link": p.get('url_pagina_web_oficial', '')
+                    })
+                    
+    # Converte para DataFrame do Pandas para facilitar a tabela
+    return pd.DataFrame(dados_completos)
 
 # ==============================================
 # 3) SIDEBAR — FILTROS
@@ -140,7 +176,11 @@ def build_where_clause():
 # ==============================================
 # 4) ESTRUTURA DE ABAS
 # ==============================================
-tab_visao, tab_proposicoes = st.tabs(["📊 Visão Geral", "📄 Lista de Proposições"])
+tab_visao, tab_proposicoes, tab_busca_global = st.tabs([
+    "📊 Visão Geral", 
+    "📄 Lista Filtrada (IA)", 
+    "🌐 Busca Global (Base Completa)"
+])
 
 # --- ABA 1: VISÃO GERAL ---
 with tab_visao:
@@ -232,3 +272,41 @@ with tab_proposicoes:
             use_container_width=True,
             hide_index=True
         )
+        # --- ABA 3: BUSCA GLOBAL (BASE COMPLETA) ---
+with tab_busca_global:
+    st.subheader("🌐 Busca na Base Completa da Câmara (Sem Filtro de IA)")
+    st.markdown("Aqui você pesquisa em **todos** os projetos coletados (mesmo os que a IA considerou irrelevantes para o tema).")
+    
+    # Barra de pesquisa exclusiva para esta aba
+    busca_livre = st.text_input("🔍 Digite o número da norma (Ex: PL 2338/2023) ou uma palavra-chave para buscar na base inteira:")
+    
+    if busca_livre:
+        with st.spinner("Buscando nos arquivos locais..."):
+            df_completo = load_base_completa()
+            
+            if not df_completo.empty:
+                # Transforma a busca e os dados em minúsculo para a pesquisa não ligar para maiúsculas/minúsculas
+                termo = busca_livre.lower()
+                
+                # Filtra o dataframe: procura na Norma OU na Ementa OU no Autor
+                mask = (
+                    df_completo['Norma'].str.lower().str.contains(termo, na=False) |
+                    df_completo['Ementa'].str.lower().str.contains(termo, na=False) |
+                    df_completo['Autor'].str.lower().str.contains(termo, na=False)
+                )
+                df_resultado = df_completo[mask]
+                
+                st.success(f"Foram encontrados **{len(df_resultado)}** projetos na base completa.")
+                
+                st.dataframe(
+                    df_resultado,
+                    column_config={
+                        "Link": st.column_config.LinkColumn("Link da Câmara")
+                    },
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.error("Nenhum dado bruto encontrado. Verifique se os arquivos JSON foram gerados.")
+    else:
+        st.info("Digite algo na barra de pesquisa acima para carregar os projetos.")
