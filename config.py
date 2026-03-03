@@ -9,10 +9,11 @@ PASTA_CSV = os.path.join(BASE_DIR, "projetos_em_csv")
 # 1. CONFIGURAÇÕES MySQL
 HOST = "localhost"
 USUARIO = "root"
-SENHA = "91574602"  # Coloque sua senha aqui
+SENHA = " "  # Coloque sua senha aqui
 NOME = "Oasis"
 
 # 2. CONFIGURAÇÕES GERAIS DA IA
+dispositivo = "cpu"    #escolha entre cpu e gpu, para alternar entre processador e placa gráfica
 CONSULTA_USUARIO = "Regulamentação inteligência artificial"
 DATA_INICIO_COLETA = datetime(2015, 1, 1) 
 MODELO_NOME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
