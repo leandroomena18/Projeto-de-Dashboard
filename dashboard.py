@@ -100,7 +100,7 @@ def load_base_completa():
 # Congela o modelo na memória RAM para as pesquisas serem instantâneas
 @st.cache_resource
 def carregar_modelo_ia():
-    return SentenceTransformer(config.MODELO_NOME)
+    return SentenceTransformer(config.MODELO_NOME, device=config.dispositivo)
 
 modelo_nlp = carregar_modelo_ia()
 
